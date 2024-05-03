@@ -1,0 +1,12 @@
+package:
+  name: ic_explore
+
+  authors: ["Oscar Toomey"]
+
+dependencies:
+  common_cells: { git: "git@github.com:pulp-platform/common_cells.git", rev: "1.35.0" }
+
+sources:
+  - src/top.sv
+
+  
