@@ -2,6 +2,7 @@ import numpy as np
 import math
 import random
 import networkx as nx
+import matplotlib.pyplot as plt
 
 TEMPLATE = """
 module switch_{name} #(
@@ -43,6 +44,8 @@ endmodule;
 """
 
 FILTER = """
+    // remove packets from input {in_p} if their destination 
+    // is not present in the routing table
     logic [0:0] filter_{in_p}_valid;
     logic [0:0] filter_{in_p}_ready;
     stream_filter i_filt{in_p} (
@@ -55,6 +58,7 @@ FILTER = """
 """
 
 DEMUX = """
+    // demux packets from input {in_p} for {num_out} destinations
     logic [$clog2({num_out})-1:0] demux_{in_p}_sel;
     logic [{num_out}-1:0] demux_{in_p}_valid;
     logic [{num_out}-1:0] demux_{in_p}_ready;
@@ -77,6 +81,7 @@ DEMUX = """
 """
 
 DEMUX_BYPASS = """
+    // packets from {in_p} are always routed the same way
     logic [0:0] demux_{in_p}_valid;
     logic [0:0] demux_{in_p}_ready;
     assign demux_{in_p}_valid = filter_{in_p}_valid;
@@ -103,12 +108,14 @@ LOAD_BALANCE = """
 """
 
 ARBITER = """
+    // arbitrate access for {num_in} connections to output
+    // port {idx_out}
     rr_arb_tree #(
         .NumIn({num_in}),
         .DataType(packet_t),
         .AxiVldRdy(1'b1),
         .LockIn(1'b1)
-    ) i_q_mux (
+    ) i_arb_{idx_out} (
         .clk_i,
         .rst_ni,
         .flush_i(1'b0),
@@ -128,13 +135,13 @@ def to_graph(route_table: np.ndarray) -> nx.MultiDiGraph:
     Inputs:
         route_table: (H_dst, H_out, H_in)
     """
-    G = nx.MultiDiGraph()
+    G = nx.DiGraph()
 
     for in_p in range(route_table.shape[2]):
-        G.add_node(f'in{in_p}', index=in_p)
+        G.add_node(f'in{in_p}', in_p=in_p)
 
     for out_p in range(route_table.shape[1]):
-        G.add_node(f'out{out_p}', index=out_p)
+        G.add_node(f'out{out_p}', out_p=out_p)
 
     print(route_table)
 
@@ -142,45 +149,50 @@ def to_graph(route_table: np.ndarray) -> nx.MultiDiGraph:
         for dst in range(route_table.shape[0]):
             # check if input has a routing rule for this dst
             if np.count_nonzero(route_table[dst, :, in_p]) > 1:
-                G.add_node(f'lb{in_p}[{dst}]', dst=dst, index=in_p)
-                G.add_edge(f'in{in_p}', f'lb{in_p}[{dst}]', dst=dst)
+                G.add_node(f'lb{in_p}[{dst}]', dst=dst, in_p=in_p)
+                G.add_edge(f'in{in_p}', f'lb{in_p}[{dst}]', dst=[dst], in_p=in_p)
             for out_p in range(route_table.shape[1]):
                 w = route_table[dst, out_p, in_p]
-                if w > 0 and np.count_nonzero(route_table[dst, :, in_p]) > 1:
-                    G.add_edge(f'lb{in_p}[{dst}]', f'out{out_p}', weight=w, dst=dst)
+                if w > 0 and np.count_nonzero(route_table[dst, :, in_p]) > 1:                 
+                    G.add_edge(f'lb{in_p}[{dst}]', f'out{out_p}', weight=w, in_p=in_p, out_p=out_p, dst=[dst])
+                elif w > 0 and G.has_edge(f'in{in_p}', f'out{out_p}'):
+                    G.edges[f'in{in_p}', f'out{out_p}']['dst'].append(dst)
                 elif w > 0:
-                    G.add_edge(f'in{in_p}', f'out{out_p}', dst=dst)
+                    G.add_edge(f'in{in_p}', f'out{out_p}', in_p=in_p, out_p=out_p, dst=[dst])
     return G
 
-def build_sv(G: nx.MultiDiGraph, num_in, num_dst, num_out):
+def build_sv(G: nx.DiGraph, num_in, num_dst, num_out):
     src = []
     in_nodes = [n for n in G.nodes() if n.startswith('in')]
-    for in_p in in_nodes:
-        idx = G.nodes[in_p]['index']
-        num_node_out = len(G.out_edges(in_p))
+    for in_n in in_nodes:
+        in_p = G.nodes[in_n]['in_p']
+        num_node_out = len(G.out_edges(in_n))
         if num_node_out == 0:
             continue
         filt = []
         cases = []
-        for i, e in enumerate(G.out_edges(in_p, keys=True)):
-            dst = G.edges[e[0], e[1], e[2]]['dst']
-            filt.append(f"addr_in[{idx}] != {i}")
-            G.edges[e[0], e[1], e[2]]['index'] = i;
-            cases.append(f"{dst}: demux_{idx}_sel = {i};")
-        filt = ' && '.join(filt)
+        for i, e in enumerate(G.out_edges(in_n)):
+            dsts = G.edges[e[0], e[1]]['dst']
+            G.edges[e[0], e[1]]['dx_index'] = i;
+            for d in dsts:
+                filt.append(f"addr_in[{in_p}] != {d}")
+                cases.append(f"{d}: demux_{in_p}_sel = {i};")
         cases = '\n\t\t\t'.join(cases)
-        src.append(FILTER.format(in_p=idx, sel=filt))
+        filt = ' && '.join(filt)
+        src.append(FILTER.format(in_p=in_p, sel=filt))
         if num_node_out == 1:
-            src.append(DEMUX_BYPASS.format(in_p=idx))
+            src.append(DEMUX_BYPASS.format(in_p=in_p))
         else:
-            src.append(DEMUX.format(num_out=num_node_out, in_p=idx, cases=cases))
+            src.append(DEMUX.format(num_out=num_node_out, in_p=in_p, cases=cases))
 
     lb_nodes = [n for n in G.nodes() if n.startswith('lb')]
     for lb in lb_nodes:
-        idx = G.nodes[lb]['index']
+        in_p = G.nodes[lb]['in_p']
         dst = G.nodes[lb]['dst']
         weights = [e[2]['weight'] for e in G.out_edges(lb, data=True)]
-        num_node_out = len(G.out_edges(in_p))
+        for i, e in enumerate(G.out_edges(lb)):
+            G.edges[e[0], e[1]]['lb_index'] = i
+        num_node_out = len(G.out_edges(lb))
         blen = int(sum(weights))
         btable = [[i]*w.astype(int) for i, w in enumerate(weights)]
         bwidth = math.ceil(math.log2(blen))
@@ -189,9 +201,35 @@ def build_sv(G: nx.MultiDiGraph, num_in, num_dst, num_out):
         btable = ', '.join(btable)
         e = list(G.in_edges(lb, data=True))
         assert len(e) == 1
-        key = e[0][2]['index']
-        src.append(LOAD_BALANCE.format(num_out=num_node_out, in_p=idx, dst=dst, bal_len=blen, btable=btable, key=key))
+        key = e[0][2]['in_p']
+        src.append(LOAD_BALANCE.format(num_out=num_node_out, in_p=in_p, dst=dst, bal_len=blen, btable=btable, key=key))
 
+    out_nodes = [n for n in G.nodes() if n.startswith('out')]
+    for out_n in out_nodes:
+        out_p = G.nodes[out_n]['out_p']
+        valid = []
+        ready = []
+        data = []
+        num_in = len(G.in_edges(out_n))
+        for i, e in enumerate(G.in_edges(out_n, data=True)):
+            in_p = e[2]['in_p']
+            if e[0].startswith('lb'):
+                dst = G.nodes[e[0]]['dst']
+                lb_index = e[2]['lb_index']
+                valid.append(f'bal_{in_p}_{dst}_valid[{lb_index}]')
+                ready.append(f'bal_{in_p}_{dst}_ready[{lb_index}]')
+            else:
+                dx_index = e[2]['dx_index']
+                valid.append(f'demux_{in_p}_valid[{dx_index}]')
+                ready.append(f'demux_{in_p}_ready[{dx_index}]')
+            data.append(f'packets[{in_p}]')
+        valid = ', '.join(valid)
+        ready = ', '.join(ready)
+        data = ', '.join(data)
+        valid = f"{{{valid}}}"
+        ready = f"{{{ready}}}"
+        data = f"{{{data}}}"
+        src.append(ARBITER.format(idx_out=out_p, num_in=num_in, valid_i=valid, ready_o=ready, data_i=data))
     return TEMPLATE.format(name='test', num_out=num_out, num_in=num_in, src='\n'.join(src))
 
 def quantize(table: np.ndarray, zero_tol: float) -> np.ndarray:
@@ -210,6 +248,11 @@ def quantize(table: np.ndarray, zero_tol: float) -> np.ndarray:
 test = np.random.rand(2, 2, 2)
 test = quantize(test, 0.3)
 G = to_graph(test)
+
+pos=nx.circular_layout(G)
+nx.draw(G, pos, with_labels = True)
+nx.draw_networkx_edge_labels(G, pos)
+plt.savefig('foo.png')
 
 txt = build_sv(G, test.shape[2], test.shape[0], test.shape[1])
 
